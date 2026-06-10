@@ -3,3 +3,4 @@ obj/
 cpu_naive
 hybrid_search
 .venv
+scratch_cuda.cu
