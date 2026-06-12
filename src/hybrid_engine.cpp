@@ -7,35 +7,36 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <immintrin.h>
 
 // Forward declarations of CUDA helper functions
 extern "C" bool cuda_init_resources(
+    uint32_t num_streams,
     uint32_t max_candidates,
     uint32_t dimension,
     uint32_t max_k,
-    float** d_query,
-    float** d_candidates,
-    DistancePair** d_distances,
-    DistancePair** d_results,
-    float** h_pinned_query,
-    float** h_pinned_candidates,
-    uint32_t** h_pinned_candidate_ids,
-    DistancePair** h_pinned_results
+    const float* centroids_host,
+    uint32_t num_centroids,
+    float** d_centroids,
+    StreamResources* streams_res
 );
 
 extern "C" void cuda_free_resources(
-    float* d_query,
-    float* d_candidates,
-    DistancePair* d_distances,
-    DistancePair* d_results,
-    float* h_pinned_query,
-    float* h_pinned_candidates,
-    uint32_t* h_pinned_candidate_ids,
-    DistancePair* h_pinned_results
+    uint32_t num_streams,
+    float* d_centroids,
+    StreamResources* streams_res
 );
 
-extern "C" void cuda_search_execution(
+extern "C" void cuda_centroid_search(
+    const float* queries_host,
+    uint32_t num_queries,
+    uint32_t dimension,
+    const float* d_centroids,
+    uint32_t num_centroids,
+    uint32_t top_n_clusters,
+    DistancePair* top_clusters_host
+);
+
+extern "C" void cuda_search_execution_async(
     const float* h_pinned_query,
     const float* h_pinned_candidates,
     const uint32_t* h_pinned_candidate_ids,
@@ -46,7 +47,9 @@ extern "C" void cuda_search_execution(
     float* d_query,
     float* d_candidates,
     DistancePair* d_distances,
-    DistancePair* d_results
+    DistancePair* d_results,
+    uint32_t* d_candidate_ids,
+    cudaStream_t stream
 );
 
 HybridEngine::HybridEngine()
@@ -54,17 +57,13 @@ HybridEngine::HybridEngine()
       vectors_fd(-1), vectors_map(MAP_FAILED), vectors_map_size(0),
       num_clusters(0), dimension(0), num_vectors(0),
       cluster_sizes(nullptr), cluster_offsets(nullptr), vector_ids(nullptr), vector_data(nullptr),
-      max_candidates(500000), max_k(256),
-      d_query(nullptr), d_candidates(nullptr), d_distances(nullptr), d_results(nullptr),
-      h_pinned_query(nullptr), h_pinned_candidates(nullptr), h_pinned_candidate_ids(nullptr), h_pinned_results(nullptr),
+      num_streams(8), max_candidates(32768), max_k(256),
+      d_centroids(nullptr),
       cuda_initialized(false) {}
 
 HybridEngine::~HybridEngine() {
     if (cuda_initialized) {
-        cuda_free_resources(
-            d_query, d_candidates, d_distances, d_results,
-            h_pinned_query, h_pinned_candidates, h_pinned_candidate_ids, h_pinned_results
-        );
+        cuda_free_resources(num_streams, d_centroids, streams_res.data());
     }
     cleanup_mmap();
 }
@@ -89,8 +88,9 @@ void HybridEngine::cleanup_mmap() {
     }
 }
 
-bool HybridEngine::init(const std::string& centroids_path, const std::string& vectors_path) {
+bool HybridEngine::init(const std::string& centroids_path, const std::string& vectors_path, int input_num_streams) {
     cleanup_mmap();
+    num_streams = input_num_streams;
 
     // 1. Map centroids
     centroids_fd = open(centroids_path.c_str(), O_RDONLY);
@@ -157,11 +157,11 @@ bool HybridEngine::init(const std::string& centroids_path, const std::string& ve
     std::cout << "[Hybrid Engine] Mapped index: " << num_vectors << " vectors, " 
               << num_clusters << " clusters, dim " << dimension << "\n";
 
-    // 3. Initialize pre-allocated CUDA resources
+    // 3. Initialize pre-allocated CUDA resources for all streams
+    streams_res.resize(num_streams);
     cuda_initialized = cuda_init_resources(
-        max_candidates, dimension, max_k,
-        &d_query, &d_candidates, &d_distances, &d_results,
-        &h_pinned_query, &h_pinned_candidates, &h_pinned_candidate_ids, &h_pinned_results
+        num_streams, max_candidates, dimension, max_k,
+        centroids_data, num_clusters, &d_centroids, streams_res.data()
     );
 
     if (!cuda_initialized) {
@@ -173,6 +173,16 @@ bool HybridEngine::init(const std::string& centroids_path, const std::string& ve
 }
 
 std::vector<DistancePair> HybridEngine::search(const float* query_vector, int k, int top_n_clusters) {
+    auto batch_results = search_batch(query_vector, 1, k, top_n_clusters);
+    return batch_results[0];
+}
+
+std::vector<std::vector<DistancePair>> HybridEngine::search_batch(
+    const float* queries_vector,
+    int num_queries,
+    int k,
+    int top_n_clusters
+) {
     if (!cuda_initialized) {
         std::cerr << "Engine not initialized\n";
         return {};
@@ -183,73 +193,83 @@ std::vector<DistancePair> HybridEngine::search(const float* query_vector, int k,
         k = max_k;
     }
 
-    // 1. CPU Centroid Search (AVX2 Pre-filter)
-    std::vector<DistancePair> centroid_distances(num_clusters);
-
-    for (uint32_t c = 0; c < num_clusters; ++c) {
-        const float* centroid = centroids_data + c * dimension;
-        
-        // AVX2 Distance calculation
-        __m256 sum = _mm256_setzero_ps();
-        for (uint32_t d = 0; d < dimension; d += 8) {
-            __m256 q = _mm256_loadu_ps(query_vector + d);
-            __m256 cent = _mm256_loadu_ps(centroid + d);
-            __m256 diff = _mm256_sub_ps(q, cent);
-            sum = _mm256_fmadd_ps(diff, diff, sum);
-        }
-
-        // Horizontal sum of the 8 float components of the AVX2 register
-        // sum = (s0, s1, s2, s3, s4, s5, s6, s7)
-        __m256 shuf = _mm256_shuffle_ps(sum, sum, _MM_SHUFFLE(1, 0, 3, 2));
-        __m256 sums = _mm256_add_ps(sum, shuf);
-        __m256 shuf2 = _mm256_shuffle_ps(sums, sums, _MM_SHUFFLE(0, 1, 0, 1));
-        __m256 sums2 = _mm256_add_ps(sums, shuf2);
-        
-        float dist_sq = ((float*)&sums2)[0] + ((float*)&sums2)[4];
-        centroid_distances[c] = {dist_sq, c};
-    }
-
-    // Sort to find the top_n_clusters closest clusters
-    std::sort(centroid_distances.begin(), centroid_distances.end(), [](const DistancePair& a, const DistancePair& b) {
-        return a.distance < b.distance;
-    });
-
-    // 2. Gather candidate vectors from mapped CPU memory
-    uint32_t total_candidates = 0;
-    for (int i = 0; i < top_n_clusters; ++i) {
-        uint32_t c_id = centroid_distances[i].id;
-        uint32_t c_size = cluster_sizes[c_id];
-        uint32_t c_offset = cluster_offsets[c_id];
-
-        if (total_candidates + c_size > max_candidates) {
-            std::cerr << "Candidates count exceeds max_candidates limit (" << max_candidates 
-                      << "). Current: " << total_candidates << ", adding: " << c_size 
-                      << " (rank " << i << ", cluster ID " << c_id << "). Truncating.\n";
-            break;
-        }
-
-        // Copy IDs to pinned host buffer
-        std::memcpy(h_pinned_candidate_ids + total_candidates, vector_ids + c_offset, c_size * sizeof(uint32_t));
-
-        // Copy Vector data to pinned host buffer
-        std::memcpy(h_pinned_candidates + total_candidates * dimension, vector_data + c_offset * dimension, c_size * dimension * sizeof(float));
-
-        total_candidates += c_size;
-    }
-
-    // Copy query vector to pinned host buffer
-    std::memcpy(h_pinned_query, query_vector, dimension * sizeof(float));
-
-    // 3. GPU CUDA Execution (Async PCIe transfer, Parallel Distances, Parallel Reduction)
-    cuda_search_execution(
-        h_pinned_query, h_pinned_candidates, h_pinned_candidate_ids,
-        total_candidates, dimension, k, h_pinned_results,
-        d_query, d_candidates, d_distances, d_results
+    // 1. GPU Centroid Search (Parallel Query, Parallel Centroid, Parallel Reduction)
+    std::vector<DistancePair> h_top_clusters(num_queries * top_n_clusters);
+    cuda_centroid_search(
+        queries_vector, num_queries, dimension,
+        d_centroids, num_clusters, top_n_clusters,
+        h_top_clusters.data()
     );
 
-    // 4. Return results (which are already copied back to h_pinned_results)
-    std::vector<DistancePair> results(k);
-    std::memcpy(results.data(), h_pinned_results, k * sizeof(DistancePair));
-    
-    return results;
+    // 2. Pipelined Loop over all queries using B CUDA streams
+    std::vector<std::vector<DistancePair>> batch_results(num_queries, std::vector<DistancePair>(k));
+
+    for (int q = 0; q < num_queries; ++q) {
+        int s = q % num_streams;
+
+        // Synchronize stream s to finish its previous query (if any) before launching a new one
+        if (q >= (int)num_streams) {
+            int prev_q = q - num_streams;
+            cudaStreamSynchronize(streams_res[s].stream);
+            std::memcpy(batch_results[prev_q].data(), streams_res[s].h_pinned_results, k * sizeof(DistancePair));
+        }
+
+        // Gather candidates from mapped CPU memory
+        uint32_t total_candidates = 0;
+        const DistancePair* q_top_clusters = &h_top_clusters[q * top_n_clusters];
+
+        for (int i = 0; i < top_n_clusters; ++i) {
+            uint32_t c_id = q_top_clusters[i].id;
+            if (c_id == 0xFFFFFFFFu) continue;
+
+            uint32_t c_size = cluster_sizes[c_id];
+            uint32_t c_offset = cluster_offsets[c_id];
+
+            if (total_candidates + c_size > max_candidates) {
+                // Truncate safely
+                c_size = max_candidates - total_candidates;
+            }
+
+            if (c_size == 0) break;
+
+            // Copy IDs and Vector data to stream's pinned host buffers
+            std::memcpy(streams_res[s].h_pinned_candidate_ids + total_candidates, vector_ids + c_offset, c_size * sizeof(uint32_t));
+            std::memcpy(streams_res[s].h_pinned_candidates + total_candidates * dimension, vector_data + c_offset * dimension, c_size * dimension * sizeof(float));
+
+            total_candidates += c_size;
+            if (total_candidates >= max_candidates) break;
+        }
+
+        // Copy query vector to stream's pinned host buffer
+        std::memcpy(streams_res[s].h_pinned_query, queries_vector + q * dimension, dimension * sizeof(float));
+
+        // Launch async copy & search kernels on stream s
+        cuda_search_execution_async(
+            streams_res[s].h_pinned_query,
+            streams_res[s].h_pinned_candidates,
+            streams_res[s].h_pinned_candidate_ids,
+            total_candidates,
+            dimension,
+            k,
+            streams_res[s].h_pinned_results,
+            streams_res[s].d_query,
+            streams_res[s].d_candidates,
+            streams_res[s].d_distances,
+            streams_res[s].d_results,
+            streams_res[s].d_candidate_ids,
+            streams_res[s].stream
+        );
+    }
+
+    // 3. Final synchronization loop for remaining active streams
+    for (int s = 0; s < (int)num_streams; ++s) {
+        for (int q = num_queries - (int)num_streams; q < num_queries; ++q) {
+            if (q >= 0 && (q % (int)num_streams) == s) {
+                cudaStreamSynchronize(streams_res[s].stream);
+                std::memcpy(batch_results[q].data(), streams_res[s].h_pinned_results, k * sizeof(DistancePair));
+            }
+        }
+    }
+
+    return batch_results;
 }

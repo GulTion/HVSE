@@ -8,7 +8,7 @@
 
 int main(int argc, char* argv[]) {
     if (argc < 5) {
-        std::cerr << "Usage: " << argv[0] << " <centroids.bin> <vectors.bin> <query_vectors.bin> <k> [num_queries] [top_n_clusters]\n";
+        std::cerr << "Usage: " << argv[0] << " <centroids.bin> <vectors.bin> <query_vectors.bin> <k> [num_queries] [top_n_clusters] [num_streams]\n";
         return 1;
     }
 
@@ -18,10 +18,11 @@ int main(int argc, char* argv[]) {
     int k = std::stoi(argv[4]);
     int num_queries_limit = (argc >= 6) ? std::stoi(argv[5]) : -1;
     int top_n_clusters = (argc >= 7) ? std::stoi(argv[6]) : 8;
+    int num_streams = (argc >= 8) ? std::stoi(argv[7]) : 8;
 
-    // Initialize Hybrid Engine
+    // Initialize Hybrid Engine with specified number of streams
     HybridEngine engine;
-    if (!engine.init(centroids_path, vectors_path)) {
+    if (!engine.init(centroids_path, vectors_path, num_streams)) {
         std::cerr << "Failed to initialize Hybrid Engine\n";
         return 1;
     }
@@ -52,33 +53,28 @@ int main(int argc, char* argv[]) {
         num_queries = num_queries_limit;
     }
 
-    std::cout << "[Hybrid Engine] Running " << num_queries << " queries (K=" << k 
-              << ", top_n_clusters=" << top_n_clusters << ")...\n";
+    std::cout << "[Hybrid Engine] Running batched search on " << num_queries << " queries (K=" << k 
+              << ", top_n_clusters=" << top_n_clusters << ", num_streams=" << num_streams << ")...\n";
 
     // Warm-up query (to trigger CUDA initialization overhead outside our timing loop)
-    engine.search(query_data.data(), k, top_n_clusters);
+    engine.search_batch(query_data.data(), 1, k, top_n_clusters);
 
-    double total_time_ms = 0.0;
+    // Timing the entire batch search
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-    for (uint32_t q = 0; q < num_queries; ++q) {
-        const float* query = &query_data[q * query_dim];
+    std::vector<std::vector<DistancePair>> results = engine.search_batch(query_data.data(), num_queries, k, top_n_clusters);
 
-        auto start_time = std::chrono::high_resolution_clock::now();
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
+    double total_time_ms = elapsed.count();
 
-        std::vector<DistancePair> results = engine.search(query, k, top_n_clusters);
-
-        auto end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
-        total_time_ms += elapsed.count();
-
-        // Print results for the first few queries
-        if (q < 5) {
-            std::cout << "Query " << q << " Top " << k << " Results:\n";
-            for (int r = 0; r < k; ++r) {
-                std::cout << "  Rank " << r 
-                          << ": ID=" << results[r].id 
-                          << ", Distance=" << std::sqrt(results[r].distance) << "\n";
-            }
+    // Print results for the first few queries for parser compatibility
+    for (uint32_t q = 0; q < std::min(num_queries, 5u); ++q) {
+        std::cout << "Query " << q << " Top " << k << " Results:\n";
+        for (int r = 0; r < k; ++r) {
+            std::cout << "  Rank " << r 
+                      << ": ID=" << results[q][r].id 
+                      << ", Distance=" << std::sqrt(results[q][r].distance) << "\n";
         }
     }
 

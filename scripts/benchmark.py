@@ -49,7 +49,7 @@ def run_benchmarks():
 
     k = 10
     num_queries = 10
-    top_n_clusters = 15
+    top_n_clusters = 10
 
     # 1. Run C++ Naive CPU search
     naive_cmd = ["./cpu_naive", base_file, query_file, str(k), str(num_queries)]

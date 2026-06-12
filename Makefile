@@ -25,6 +25,7 @@ NVCCFLAGS += $(GPU_ARCH)
 # Output binaries
 NAIVE_BIN = cpu_naive
 HYBRID_BIN = hybrid_search
+INDEX_BIN = build_index_cuda
 
 # Source and Object files
 SRC_DIR = src
@@ -34,7 +35,7 @@ OBJ_DIR = obj
 $(shell mkdir -p $(OBJ_DIR))
 
 # Default target
-all: $(NAIVE_BIN) $(HYBRID_BIN)
+all: $(NAIVE_BIN) $(HYBRID_BIN) $(INDEX_BIN)
 
 # Link Naive CPU baseline
 $(NAIVE_BIN): $(OBJ_DIR)/cpu_naive.o
@@ -43,6 +44,10 @@ $(NAIVE_BIN): $(OBJ_DIR)/cpu_naive.o
 # Link Hybrid Search Engine (Host code + CUDA device code)
 $(HYBRID_BIN): $(OBJ_DIR)/main.o $(OBJ_DIR)/hybrid_engine.o $(OBJ_DIR)/kernel.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(CUDA_LIB)
+
+# Link CUDA Index Builder
+$(INDEX_BIN): $(OBJ_DIR)/build_index_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^
 
 # Compile C++ source files
 $(OBJ_DIR)/cpu_naive.o: $(SRC_DIR)/cpu_naive.cpp $(SRC_DIR)/common.h
@@ -54,12 +59,15 @@ $(OBJ_DIR)/hybrid_engine.o: $(SRC_DIR)/hybrid_engine.cpp $(SRC_DIR)/hybrid_engin
 $(OBJ_DIR)/main.o: $(SRC_DIR)/main.cpp $(SRC_DIR)/hybrid_engine.h $(SRC_DIR)/common.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-# Compile CUDA source file
+# Compile CUDA source files
 $(OBJ_DIR)/kernel.o: $(SRC_DIR)/kernel.cu $(SRC_DIR)/common.h
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/build_index_cuda.o: $(SRC_DIR)/build_index_cuda.cu $(SRC_DIR)/common.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
 
 # Clean build artifacts
 clean:
-	rm -rf $(OBJ_DIR) $(NAIVE_BIN) $(HYBRID_BIN)
+	rm -rf $(OBJ_DIR) $(NAIVE_BIN) $(HYBRID_BIN) $(INDEX_BIN)
 
 .PHONY: all clean

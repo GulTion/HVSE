@@ -4,3 +4,5 @@ cpu_naive
 hybrid_search
 .venv
 scratch_cuda.cu
+build_index_cuda
+src/build_index_cuda.cu

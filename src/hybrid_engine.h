@@ -10,11 +10,14 @@ public:
     HybridEngine();
     ~HybridEngine();
 
-    // Initialize the engine by mapping the centroids and vector database
-    bool init(const std::string& centroids_path, const std::string& vectors_path);
+    // Initialize the engine by mapping data and loading centroids to GPU
+    bool init(const std::string& centroids_path, const std::string& vectors_path, int num_streams = 8);
 
-    // Search for the top K closest vectors for a given query vector
+    // Search for the top K closest vectors for a single query (legacy, can redirect to search_batch)
     std::vector<DistancePair> search(const float* query_vector, int k, int top_n_clusters = 8);
+
+    // Search for the top K closest vectors for a batch of queries using pipelined streams
+    std::vector<std::vector<DistancePair>> search_batch(const float* queries_vector, int num_queries, int k, int top_n_clusters = 8);
 
     // Get database info
     uint32_t get_num_vectors() const { return num_vectors; }
@@ -42,21 +45,16 @@ private:
     uint32_t* vector_ids;
     float* vector_data;
 
-    // Preallocated CUDA resources to eliminate allocation overhead during queries
+    // Preallocated CUDA resources
+    uint32_t num_streams;
     uint32_t max_candidates;
     uint32_t max_k;
     
-    // Device pointers
-    float* d_query;
-    float* d_candidates;
-    DistancePair* d_distances;
-    DistancePair* d_results;
+    // Centroid GPU buffer (loaded once during init)
+    float* d_centroids;
 
-    // Pinned host pointers
-    float* h_pinned_query;
-    float* h_pinned_candidates;
-    uint32_t* h_pinned_candidate_ids;
-    DistancePair* h_pinned_results;
+    // Vector of stream resources for pipelining
+    std::vector<StreamResources> streams_res;
 
     bool cuda_initialized;
 
